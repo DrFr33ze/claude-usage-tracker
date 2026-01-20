@@ -1,0 +1,5 @@
+# Cargo configuration
+
+# Integration tests in tests/ directory use wiremock and share state via OnceLock.
+# They should be run with --test-threads=1 to avoid race conditions.
+# The note in tests/integration.rs documents this requirement.

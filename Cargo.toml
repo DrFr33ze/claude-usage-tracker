@@ -1,0 +1,66 @@
+[package]
+name = "claude-usage-tracker"
+version = "0.1.0"
+description = "Claude Code Usage Tracker - Monitor your Claude API usage from the system tray"
+authors = ["You"]
+license = "MIT"
+repository = ""
+edition = "2021"
+rust-version = "1.77.2"
+
+[[bin]]
+name = "claude-usage-tracker"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.5.3", features = [] }
+
+[dependencies]
+# Core Tauri
+tauri = { version = "2.9.5", features = ["tray-icon", "image-png"] }
+tauri-plugin-notification = "2"
+tauri-plugin-autostart = "2"
+
+# Async and networking
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Data handling
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2"
+
+# Utilities
+fastrand = "2"
+toml = "0.8"
+dirs = "6"
+secrecy = "0.10"
+
+# Logging
+tauri-plugin-log = "2"
+log = "0.4"
+
+# Platform-specific
+[target.'cfg(target_os = "linux")'.dependencies]
+glib = "0.18"  # For suppressing libayatana-appindicator deprecation warnings
+
+[features]
+testing = []
+
+[dev-dependencies]
+wiremock = "0.6"
+serial_test = "3.0"
+# Enable testing feature for integration tests in tests/ directory
+claude-usage-tracker = { path = ".", features = ["testing"] }
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "z"
+strip = true

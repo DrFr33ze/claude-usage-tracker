@@ -25,7 +25,7 @@
 //!
 //! ## Platform Notes
 //!
-//! - **Windows**: Uses `%APPDATA%\\claude\\.credentials.json`
+//! - **Windows**: Uses `%USERPROFILE%\\.claude\\.credentials.json`
 //! - **Linux/macOS**: Uses `~/.claude/.credentials.json`
 
 use anyhow::{Context, Result};
@@ -162,9 +162,10 @@ pub fn load_credentials() -> Result<Credentials, AuthContextError> {
 pub fn get_credentials_path() -> Result<PathBuf> {
     #[cfg(windows)]
     {
-        let appdata = std::env::var("APPDATA").context("APPDATA environment variable not set")?;
-        Ok(PathBuf::from(appdata)
-            .join("claude")
+        let userprofile =
+            std::env::var("USERPROFILE").context("USERPROFILE environment variable not set")?;
+        Ok(PathBuf::from(userprofile)
+            .join(".claude")
             .join(".credentials.json"))
     }
     #[cfg(not(windows))]

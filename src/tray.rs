@@ -10,6 +10,7 @@
 // =============================================================================
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 
 use tauri::image::Image;
@@ -94,6 +95,8 @@ pub enum MenuId {
     UsageSonnet,
     LastChecked,
     StartOnLogin,
+    RefreshOnOpen,
+    Reauth,
     Refresh,
     Quit,
 }
@@ -149,6 +152,8 @@ impl std::str::FromStr for MenuId {
             "usage-sonnet" => Ok(Self::UsageSonnet),
             "last-checked" => Ok(Self::LastChecked),
             "start-on-login" => Ok(Self::StartOnLogin),
+            "refresh-on-open" => Ok(Self::RefreshOnOpen),
+            "reauth" => Ok(Self::Reauth),
             "refresh" => Ok(Self::Refresh),
             "quit" => Ok(Self::Quit),
             _ => Err(()),
@@ -191,6 +196,8 @@ impl MenuId {
             Self::UsageSonnet => "usage-sonnet",
             Self::LastChecked => "last-checked",
             Self::StartOnLogin => "start-on-login",
+            Self::RefreshOnOpen => "refresh-on-open",
+            Self::Reauth => "reauth",
             Self::Refresh => "refresh",
             Self::Quit => "quit",
         }
@@ -252,6 +259,10 @@ pub fn create_tray(app: &AppHandle) -> Result<TrayIcon, tauri::Error> {
         .on_tray_icon_event(move |tray, event| {
             if let tauri::tray::TrayIconEvent::Click { .. } = event {
                 let state: tauri::State<Arc<AppState>> = tray.app_handle().state();
+                if !state.refresh_on_open.load(Ordering::Relaxed) {
+                    log::debug!("Tray icon clicked - refresh on open disabled");
+                    return;
+                }
                 // Check cooldown before triggering refresh (uses std::sync::Mutex to avoid deadlock)
                 // SAFETY: Mutex poisoning indicates a thread panicked while holding the lock.
                 // In a tray callback, crashing is safer than continuing with corrupted state.
@@ -295,6 +306,41 @@ pub fn create_tray(app: &AppHandle) -> Result<TrayIcon, tauri::Error> {
                             .await;
                         app_handle.exit(0);
                     });
+                }
+                Some(MenuId::RefreshOnOpen) => {
+                    log::info!("Refresh on open toggle requested from tray menu");
+                    let state: tauri::State<Arc<AppState>> = app.state();
+                    let current = state.refresh_on_open.load(Ordering::Relaxed);
+                    state.refresh_on_open.store(!current, Ordering::Relaxed);
+                    log::info!("Refresh on open set to {}", !current);
+                    let app_clone = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        update_tray_menu(&app_clone).await;
+                    });
+                }
+                Some(MenuId::Reauth) => {
+                    log::info!("Re-authentication requested from tray menu");
+                    #[cfg(windows)]
+                    {
+                        use std::os::windows::process::CommandExt;
+                        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                        if let Err(e) = std::process::Command::new("cmd")
+                            .args(["/c", "claude", "auth", "login"])
+                            .creation_flags(CREATE_NO_WINDOW)
+                            .spawn()
+                        {
+                            log::error!("Failed to launch claude auth login: {e}");
+                        }
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        if let Err(e) = std::process::Command::new("claude")
+                            .args(["auth", "login"])
+                            .spawn()
+                        {
+                            log::error!("Failed to launch claude auth login: {e}");
+                        }
+                    }
                 }
                 Some(MenuId::StartOnLogin) => {
                     log::info!("Start on login toggle requested from tray menu");
@@ -448,7 +494,7 @@ pub async fn update_tray_menu(app: &AppHandle) {
             };
             let text = format!("Error: {truncated}");
             let _ = tray.set_tooltip(Some(&text));
-            build_status_menu(app, &text)
+            build_status_menu(app, &text, true)
         }
         (Some(u), None) => {
             let five_h = u.five_hour.as_ref().map_or(0.0, |w| w.utilization.as_f64());
@@ -459,7 +505,7 @@ pub async fn update_tray_menu(app: &AppHandle) {
         }
         (None, None) => {
             let _ = tray.set_tooltip(Some("Loading..."));
-            build_status_menu(app, "Loading...")
+            build_status_menu(app, "Loading...", false)
         }
     };
 
@@ -504,6 +550,25 @@ pub fn get_icon_name_for_usage(usage: &UsageResponse, config: &Config) -> IconNa
 // =============================================================================
 // Private Functions
 // =============================================================================
+
+/// Create the "Refresh on open" menu item with checkmark indicator
+fn create_refresh_on_open_menu_item(app: &AppHandle) -> Option<MenuItem<tauri::Wry>> {
+    let state: tauri::State<Arc<AppState>> = app.state();
+    let enabled = state.refresh_on_open.load(Ordering::Relaxed);
+    let text = if enabled {
+        "  ✓ Refresh on open"
+    } else {
+        "    Refresh on open"
+    };
+    MenuItem::with_id(
+        app,
+        MenuId::RefreshOnOpen.as_str(),
+        text,
+        true,
+        None::<&str>,
+    )
+    .ok()
+}
 
 /// Check if start on login is enabled
 fn is_autostart_enabled(app: &AppHandle) -> bool {
@@ -572,7 +637,7 @@ fn get_utilization(window: Option<&crate::api::UsageWindow>) -> f64 {
 }
 
 /// Build a simple status menu (error/loading states)
-fn build_status_menu(app: &AppHandle, status_text: &str) -> Option<Menu<tauri::Wry>> {
+fn build_status_menu(app: &AppHandle, status_text: &str, show_reauth: bool) -> Option<Menu<tauri::Wry>> {
     use tauri::menu::PredefinedMenuItem;
 
     let header = MenuItem::with_id(
@@ -582,35 +647,43 @@ fn build_status_menu(app: &AppHandle, status_text: &str) -> Option<Menu<tauri::W
         false,
         None::<&str>,
     )
-    .ok();
-    let sep1 = PredefinedMenuItem::separator(app).ok();
-    let status = MenuItem::with_id(
-        app,
-        MenuId::Status.as_str(),
-        status_text,
-        false,
-        None::<&str>,
-    )
-    .ok();
-    let sep2 = PredefinedMenuItem::separator(app).ok();
-    let autostart = create_autostart_menu_item(app);
+    .ok()?;
+    let sep1 = PredefinedMenuItem::separator(app).ok()?;
+    let status =
+        MenuItem::with_id(app, MenuId::Status.as_str(), status_text, false, None::<&str>)
+            .ok()?;
+    let sep2 = PredefinedMenuItem::separator(app).ok()?;
+    let autostart = create_autostart_menu_item(app)?;
+    let refresh_on_open = create_refresh_on_open_menu_item(app)?;
+    let refresh =
+        MenuItem::with_id(app, MenuId::Refresh.as_str(), "  ↻ Refresh", true, None::<&str>)
+            .ok()?;
+    let quit =
+        MenuItem::with_id(app, MenuId::Quit.as_str(), "  Quit", true, None::<&str>).ok()?;
 
-    let refresh = MenuItem::with_id(
-        app,
-        MenuId::Refresh.as_str(),
-        "  ↻ Refresh",
-        true,
-        None::<&str>,
-    )
-    .ok();
-    let quit = MenuItem::with_id(app, MenuId::Quit.as_str(), "  Quit", true, None::<&str>).ok();
+    let mut items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> =
+        vec![&header, &sep1, &status, &sep2, &autostart, &refresh_on_open];
 
-    match (header, sep1, status, sep2, autostart, refresh, quit) {
-        (Some(h), Some(s1), Some(st), Some(s2), Some(a), Some(r), Some(q)) => {
-            Menu::with_items(app, &[&h, &s1, &st, &s2, &a, &r, &q]).ok()
-        }
-        _ => None,
+    let reauth = if show_reauth {
+        MenuItem::with_id(
+            app,
+            MenuId::Reauth.as_str(),
+            "  ⟳ Re-authenticate",
+            true,
+            None::<&str>,
+        )
+        .ok()
+    } else {
+        None
+    };
+    if let Some(ref r) = reauth {
+        items.push(r);
     }
+
+    items.push(&refresh);
+    items.push(&quit);
+
+    Menu::with_items(app, &items).ok()
 }
 
 /// Build a usage menu with current usage data
@@ -677,7 +750,7 @@ fn build_usage_menu(
     let sep2 = PredefinedMenuItem::separator(app).ok()?;
 
     let autostart = create_autostart_menu_item(app)?;
-
+    let refresh_on_open = create_refresh_on_open_menu_item(app)?;
     let refresh = MenuItem::with_id(
         app,
         MenuId::Refresh.as_str(),
@@ -702,6 +775,7 @@ fn build_usage_menu(
     items.push(&item_last_checked);
     items.push(&sep2);
     items.push(&autostart);
+    items.push(&refresh_on_open);
     items.push(&refresh);
     items.push(&quit);
 

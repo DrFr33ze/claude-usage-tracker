@@ -15,6 +15,7 @@ pub mod tray;
 pub use auth::Credentials;
 pub use config::Config;
 
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -96,6 +97,8 @@ pub struct AppState {
     pub cancel_token: CancellationToken,
     /// Read-only configuration (immutable after startup)
     pub config: Config,
+    /// Whether clicking the tray icon triggers a data refresh
+    pub refresh_on_open: AtomicBool,
     /// HTTP client with connection pooling (immutable after startup)
     pub http_client: reqwest::Client,
 }
@@ -121,6 +124,7 @@ impl AppState {
             cancel_token,
             config,
             http_client,
+            refresh_on_open: AtomicBool::new(true),
         }
     }
 }

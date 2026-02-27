@@ -11,11 +11,6 @@
   "app": {
     "withGlobalTauri": true,
     "windows": [],
-    "trayIcon": {
-      "iconPath": "icons/tray.png",
-      "iconAsTemplate": true,
-      "tooltip": "Claude Usage Tracker"
-    },
     "security": {
       "csp": "default-src 'self'"
     }

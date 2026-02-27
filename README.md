@@ -1,5 +1,16 @@
 # Claude Usage Tracker
 
+> **Fork of [vampik33/claude-usage-tracker](https://github.com/vampik33/claude-usage-tracker)**
+>
+> ### Changes from the original
+>
+> - **Fixed credentials path on Windows**: Reads credentials from `%USERPROFILE%\.claude\.credentials.json` instead of `%APPDATA%\claude\.credentials.json`
+> - **Fixed duplicate tray icon**: Removed the static icon declaration from `tauri.conf.json` that caused a second icon to appear alongside the dynamic one
+> - **Re-authenticate button**: When authentication fails, a "⟳ Re-authenticate" button appears in the tray menu that launches `claude auth login` automatically
+> - **Refresh on open toggle**: A "Refresh on open" option in the tray menu controls whether clicking the tray icon triggers a data refresh
+
+---
+
 A lightweight **cross-platform** system tray application for monitoring your Claude Code API usage in real-time. Available for **Linux**, **macOS**, and **Windows**.
 
 ## Features
@@ -35,7 +46,7 @@ The tray menu displays usage for each time window with visual progress bars, col
 
 ## Installation
 
-Download the latest release for your platform from the [Releases page](https://github.com/user/claude-usage-tracker/releases).
+Download the latest release for your platform from the [Releases page](https://github.com/DrFr33ze/claude-usage-tracker/releases).
 
 ---
 
@@ -124,8 +135,8 @@ brew install --cask claude-usage-tracker
 
 ```bash
 # Clone and build
-git clone <repository-url>
-cd claude-usage
+git clone https://github.com/DrFr33ze/claude-usage-tracker
+cd claude-usage-tracker
 cargo tauri build
 
 # Binary will be in target/release/bundle/

@@ -4,6 +4,50 @@ A concise command reference for everyday Git and GitHub usage.
 
 ---
 
+## Release Workflow (this project)
+
+### Everyday work — commit & push changes
+
+```bash
+git add src/some-file.rs          # stage changed files
+git commit -m "Description"
+git push
+```
+
+### Publishing a new release
+
+> **Important:** Always use `git push origin <tag>` to create releases —
+> never `gh release create`. Only a real git push triggers the build workflow.
+
+**1. Bump the version in both files:**
+
+```
+Cargo.toml        →  version = "0.x.0"
+tauri.conf.json   →  "version": "0.x.0"
+```
+
+**2. Commit and push:**
+
+```bash
+git add Cargo.toml tauri.conf.json
+git commit -m "Bump version to 0.x.0"
+git push
+```
+
+**3. Create and push the tag:**
+
+```bash
+git tag -a v0.x.0 -m "v0.x.0 — Short description"
+git push origin v0.x.0
+```
+
+**4. Wait ~10–15 minutes.**
+The GitHub Actions workflow (`.github/workflows/release.yml`) builds automatically on Windows, macOS and Linux and publishes the release with all installers attached.
+
+Check progress: https://github.com/DrFr33ze/claude-usage-tracker/actions
+
+---
+
 ## Setup
 
 ```bash

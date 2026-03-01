@@ -1,6 +1,6 @@
 [package]
 name = "claude-usage-tracker"
-version = "0.1.0"
+version = "0.2.0"
 description = "Claude Code Usage Tracker - Monitor your Claude API usage from the system tray"
 authors = ["You"]
 license = "MIT"

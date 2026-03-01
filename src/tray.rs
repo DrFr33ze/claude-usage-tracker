@@ -3,7 +3,9 @@
 //! This module handles all tray-related functionality including:
 //! - Split icon system showing 5-hour (left) and 7-day (right) status
 //! - Menu construction with usage data display
-//! - Tray event handling (click refresh, quit)
+//! - Tray event handling:
+//!   - Left-click → show popup window
+//!   - Right-click → context menu (settings)
 
 // =============================================================================
 // Imports
@@ -16,7 +18,7 @@ use std::sync::{Arc, OnceLock};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition};
 use tauri_plugin_autostart::ManagerExt as _;
 
 use crate::api::UsageResponse;
@@ -28,15 +30,17 @@ use crate::AppState;
 // =============================================================================
 
 // Display and UI constants
-const DISPLAY_PROGRESS_BAR_WIDTH: u8 = 10;
 const DISPLAY_TOOLTIP_MAX_LENGTH: usize = 50;
 const DISPLAY_TOOLTIP_TRUNCATED_LENGTH: usize = 47;
-const DISPLAY_HOURS_PER_DAY: i64 = 24;
-const DISPLAY_MINUTES_PER_HOUR: i64 = 60;
 
 // Timing constants
-const TIMING_TRAY_CLICK_REFRESH_COOLDOWN_SECS: i64 = 30;
 const TIMING_GRACEFUL_SHUTDOWN_DELAY_MS: u64 = 100;
+
+// Popup window dimensions (must match the window built in lib.rs)
+const POPUP_WIDTH: i32 = 290;
+const POPUP_HEIGHT: i32 = 140;
+/// Approximate taskbar height in logical pixels (used for default positioning)
+const TASKBAR_APPROX_PX: i32 = 48;
 
 // Tray identifier
 const TRAY_ID: &str = "main-tray";
@@ -46,7 +50,6 @@ const ICON_LOADING: &[u8] = include_bytes!("../icons/icon-loading.png");
 const ICON_ERROR: &[u8] = include_bytes!("../icons/icon-error.png");
 
 // Split icons: left half = 5-hour status, right half = 7-day status
-// n = normal, w = warning, c = critical
 const ICON_NN: &[u8] = include_bytes!("../icons/icon-nn.png");
 const ICON_NW: &[u8] = include_bytes!("../icons/icon-nw.png");
 const ICON_NC: &[u8] = include_bytes!("../icons/icon-nc.png");
@@ -57,20 +60,7 @@ const ICON_CN: &[u8] = include_bytes!("../icons/icon-cn.png");
 const ICON_CW: &[u8] = include_bytes!("../icons/icon-cw.png");
 const ICON_CC: &[u8] = include_bytes!("../icons/icon-cc.png");
 
-// Cache for decoded icons using OnceLock + HashMap for efficient access
 static ICON_CACHE: OnceLock<HashMap<IconName, Image<'static>>> = OnceLock::new();
-
-// =============================================================================
-// Submodules
-// =============================================================================
-
-/// Window label constants for consistent usage across the tray
-mod window_labels {
-    pub const FIVE_HOUR: &str = "5h";
-    pub const SEVEN_DAY: &str = "7d";
-    pub const OPUS: &str = "Opus";
-    pub const SONNET: &str = "Sonnet";
-}
 
 // =============================================================================
 // Public Types
@@ -89,15 +79,11 @@ pub enum UsageLevel {
 pub enum MenuId {
     Header,
     Status,
-    Usage5h,
-    Usage7d,
-    UsageOpus,
-    UsageSonnet,
-    LastChecked,
+    KeepWindowOpen,
+    AlwaysOnTop,
     StartOnLogin,
     RefreshOnOpen,
     Reauth,
-    Refresh,
     Quit,
 }
 
@@ -105,33 +91,18 @@ pub enum MenuId {
 // Private Types
 // =============================================================================
 
-/// Icon variants for type-safe icon lookup.
-///
-/// Each variant corresponds to a tray icon file. The split icons encode
-/// 5-hour (left) and 7-day (right) status: N=normal, W=warning, C=critical.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IconName {
-    /// Normal 5h, Normal 7d (green/green)
     Nn,
-    /// Normal 5h, Warning 7d (green/yellow)
     Nw,
-    /// Normal 5h, Critical 7d (green/red)
     Nc,
-    /// Warning 5h, Normal 7d (yellow/green)
     Wn,
-    /// Warning 5h, Warning 7d (yellow/yellow)
     Ww,
-    /// Warning 5h, Critical 7d (yellow/red)
     Wc,
-    /// Critical 5h, Normal 7d (red/green)
     Cn,
-    /// Critical 5h, Warning 7d (red/yellow)
     Cw,
-    /// Critical 5h, Critical 7d (red/red)
     Cc,
-    /// Loading state icon
     Loading,
-    /// Error state icon
     Error,
 }
 
@@ -146,15 +117,11 @@ impl std::str::FromStr for MenuId {
         match s {
             "header" => Ok(Self::Header),
             "status" => Ok(Self::Status),
-            "usage-5h" => Ok(Self::Usage5h),
-            "usage-7d" => Ok(Self::Usage7d),
-            "usage-opus" => Ok(Self::UsageOpus),
-            "usage-sonnet" => Ok(Self::UsageSonnet),
-            "last-checked" => Ok(Self::LastChecked),
+            "keep-window-open" => Ok(Self::KeepWindowOpen),
+            "always-on-top" => Ok(Self::AlwaysOnTop),
             "start-on-login" => Ok(Self::StartOnLogin),
             "refresh-on-open" => Ok(Self::RefreshOnOpen),
             "reauth" => Ok(Self::Reauth),
-            "refresh" => Ok(Self::Refresh),
             "quit" => Ok(Self::Quit),
             _ => Err(()),
         }
@@ -162,7 +129,6 @@ impl std::str::FromStr for MenuId {
 }
 
 impl UsageLevel {
-    /// Determine usage level based on utilization and config thresholds
     pub fn from_utilization(utilization: f64, config: &Config) -> Self {
         if config.is_above_critical(utilization) {
             UsageLevel::Critical
@@ -173,9 +139,6 @@ impl UsageLevel {
         }
     }
 
-    /// Convert to single character for icon naming (n=normal, w=warning, c=critical)
-    ///
-    /// Used for constructing icon filenames in debug logs (e.g., "icon-nw.png" for Normal+Warning).
     pub fn to_char(self) -> char {
         match self {
             Self::Normal => 'n',
@@ -190,22 +153,17 @@ impl MenuId {
         match self {
             Self::Header => "header",
             Self::Status => "status",
-            Self::Usage5h => "usage-5h",
-            Self::Usage7d => "usage-7d",
-            Self::UsageOpus => "usage-opus",
-            Self::UsageSonnet => "usage-sonnet",
-            Self::LastChecked => "last-checked",
+            Self::KeepWindowOpen => "keep-window-open",
+            Self::AlwaysOnTop => "always-on-top",
             Self::StartOnLogin => "start-on-login",
             Self::RefreshOnOpen => "refresh-on-open",
             Self::Reauth => "reauth",
-            Self::Refresh => "refresh",
             Self::Quit => "quit",
         }
     }
 }
 
 impl IconName {
-    /// Get the static bytes for this icon variant
     fn bytes(&self) -> &'static [u8] {
         match self {
             Self::Nn => ICON_NN,
@@ -227,14 +185,10 @@ impl IconName {
 // Public Functions
 // =============================================================================
 
-/// Create the system tray with menu
+/// Create the system tray with menu.
 ///
-/// # Panics
-///
-/// Panics if the `cancel_token` mutex is poisoned.
+/// Left-click shows the popup window; right-click shows the context menu.
 pub fn create_tray(app: &AppHandle) -> Result<TrayIcon, tauri::Error> {
-    // Use hardcoded constants from main.rs
-    let click_cooldown_secs = TIMING_TRAY_CLICK_REFRESH_COOLDOWN_SECS;
     let graceful_delay_ms = TIMING_GRACEFUL_SHUTDOWN_DELAY_MS;
 
     let quit_item = MenuItem::with_id(app, MenuId::Quit.as_str(), "Quit", true, None::<&str>)?;
@@ -248,58 +202,35 @@ pub fn create_tray(app: &AppHandle) -> Result<TrayIcon, tauri::Error> {
 
     let menu = Menu::with_items(app, &[&loading_item, &quit_item])?;
 
-    // SAFETY: The "loading" icon is a bundled resource that must exist for the app to function.
-    // If it's missing, this is a build/packaging error and we should fail fast.
     let icon = get_icon(IconName::Loading).expect("loading icon must decode");
 
     let tray = TrayIconBuilder::with_id(TRAY_ID)
         .icon(icon)
         .menu(&menu)
         .tooltip("Claude Usage Tracker - Loading...")
+        // Prevent the menu from auto-opening on left-click so we can show popup instead
+        .show_menu_on_left_click(false)
         .on_tray_icon_event(move |tray, event| {
-            if let tauri::tray::TrayIconEvent::Click { .. } = event {
-                let state: tauri::State<Arc<AppState>> = tray.app_handle().state();
-                if !state.refresh_on_open.load(Ordering::Relaxed) {
-                    log::debug!("Tray icon clicked - refresh on open disabled");
-                    return;
-                }
-                // Check cooldown before triggering refresh (uses std::sync::Mutex to avoid deadlock)
-                // SAFETY: Mutex poisoning indicates a thread panicked while holding the lock.
-                // In a tray callback, crashing is safer than continuing with corrupted state.
-                let last_checked = state
-                    .last_checked
-                    .lock()
-                    .expect("last_checked lock should not be poisoned");
-                let should_refresh = match *last_checked {
-                    None => true,
-                    Some(ts) => {
-                        let now = chrono::Utc::now();
-                        let duration = now.signed_duration_since(ts);
-                        duration.num_seconds() > click_cooldown_secs
-                    }
-                };
-                drop(last_checked);
-                if should_refresh {
-                    log::debug!("Tray icon clicked - triggering refresh");
-                    state.refresh_notify.notify_one();
-                } else {
-                    log::debug!("Tray icon clicked - skipping refresh (cooldown)");
+            // Left-click (button-up) → show popup window
+            if let tauri::tray::TrayIconEvent::Click {
+                button,
+                button_state,
+                ..
+            } = event
+            {
+                if button == tauri::tray::MouseButton::Left
+                    && button_state == tauri::tray::MouseButtonState::Up
+                {
+                    show_popup(tray.app_handle());
                 }
             }
         })
         .on_menu_event(move |app, event| {
             match event.id.as_ref().parse::<MenuId>().ok() {
-                Some(MenuId::Refresh) => {
-                    log::info!("Refresh requested from tray menu");
-                    let state: tauri::State<Arc<AppState>> = app.state();
-                    state.refresh_notify.notify_one();
-                }
                 Some(MenuId::Quit) => {
                     log::info!("Quit requested from tray menu");
-                    // Cancel the polling loop for graceful shutdown
                     let state: tauri::State<Arc<AppState>> = app.state();
                     state.cancel_token.cancel();
-                    // Exit after a brief delay to allow polling loop to clean up
                     let app_handle = app.clone();
                     tauri::async_runtime::spawn(async move {
                         tokio::time::sleep(std::time::Duration::from_millis(graceful_delay_ms))
@@ -307,8 +238,39 @@ pub fn create_tray(app: &AppHandle) -> Result<TrayIcon, tauri::Error> {
                         app_handle.exit(0);
                     });
                 }
+                Some(MenuId::KeepWindowOpen) => {
+                    log::info!("Keep window open toggle requested");
+                    let state: tauri::State<Arc<AppState>> = app.state();
+                    let current = state.keep_window_open.load(Ordering::Relaxed);
+                    state.keep_window_open.store(!current, Ordering::Relaxed);
+                    log::info!("Keep window open set to {}", !current);
+                    // Emit updated DTO to popup so Close button visibility updates
+                    let state_inner = state.inner().clone();
+                    let app_clone = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let dto = crate::commands::build_usage_dto(&state_inner).await;
+                        app_clone.emit("usage-updated", &dto).ok();
+                        update_tray_menu(&app_clone).await;
+                    });
+                }
+                Some(MenuId::AlwaysOnTop) => {
+                    log::info!("Always on top toggle requested");
+                    let state: tauri::State<Arc<AppState>> = app.state();
+                    let current = state.always_on_top.load(Ordering::Relaxed);
+                    state.always_on_top.store(!current, Ordering::Relaxed);
+                    log::info!("Always on top set to {}", !current);
+                    if let Some(popup) = app.get_webview_window("popup") {
+                        if let Err(e) = popup.set_always_on_top(!current) {
+                            log::error!("Failed to set always on top: {e}");
+                        }
+                    }
+                    let app_clone = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        update_tray_menu(&app_clone).await;
+                    });
+                }
                 Some(MenuId::RefreshOnOpen) => {
-                    log::info!("Refresh on open toggle requested from tray menu");
+                    log::info!("Refresh on open toggle requested");
                     let state: tauri::State<Arc<AppState>> = app.state();
                     let current = state.refresh_on_open.load(Ordering::Relaxed);
                     state.refresh_on_open.store(!current, Ordering::Relaxed);
@@ -343,17 +305,15 @@ pub fn create_tray(app: &AppHandle) -> Result<TrayIcon, tauri::Error> {
                     }
                 }
                 Some(MenuId::StartOnLogin) => {
-                    log::info!("Start on login toggle requested from tray menu");
+                    log::info!("Start on login toggle requested");
                     let manager = app.autolaunch();
                     match manager.is_enabled() {
                         Ok(true) => {
-                            log::info!("Disabling start on login");
                             if let Err(e) = manager.disable() {
                                 log::error!("Failed to disable start on login: {e}");
                             }
                         }
                         Ok(false) => {
-                            log::info!("Enabling start on login");
                             if let Err(e) = manager.enable() {
                                 log::error!("Failed to enable start on login: {e}");
                             }
@@ -362,23 +322,17 @@ pub fn create_tray(app: &AppHandle) -> Result<TrayIcon, tauri::Error> {
                             log::error!("Failed to check start on login state: {e}");
                         }
                     }
-                    // Update menu to reflect new state
                     let app_clone = app.clone();
                     tauri::async_runtime::spawn(async move {
                         update_tray_menu(&app_clone).await;
                     });
                 }
-                // Non-interactive menu items (labels, separators) - no action needed
-                Some(
-                    MenuId::Header
-                    | MenuId::Status
-                    | MenuId::Usage5h
-                    | MenuId::Usage7d
-                    | MenuId::UsageOpus
-                    | MenuId::UsageSonnet
-                    | MenuId::LastChecked,
-                ) => {}
-                // Unknown menu ID - log for debugging
+                // Header → open GitHub repo in browser
+                Some(MenuId::Header) => {
+                    crate::commands::open_github();
+                }
+                // Non-interactive label items
+                Some(MenuId::Status) => {}
                 None => {
                     log::debug!("Unknown menu event: {}", event.id.as_ref());
                 }
@@ -390,13 +344,69 @@ pub fn create_tray(app: &AppHandle) -> Result<TrayIcon, tauri::Error> {
     Ok(tray)
 }
 
+/// Toggle the popup window: hide if currently visible, show at saved position otherwise.
+pub fn show_popup(app: &AppHandle) {
+    let Some(popup) = app.get_webview_window("popup") else {
+        log::error!("Popup window not found");
+        return;
+    };
+
+    // Toggle: if already visible, save position and hide
+    if popup.is_visible().unwrap_or(false) {
+        let state: tauri::State<Arc<AppState>> = app.state();
+        if let Ok(pos) = popup.outer_position() {
+            *state
+                .window_position
+                .lock()
+                .expect("window_position lock not poisoned") = Some((pos.x, pos.y));
+            crate::save_window_position_to_file(pos.x, pos.y);
+        }
+        let _ = popup.hide();
+        return;
+    }
+
+    let state: tauri::State<Arc<AppState>> = app.state();
+
+    // Determine where to show the popup
+    let saved = {
+        let pos = state
+            .window_position
+            .lock()
+            .expect("window_position lock not poisoned");
+        *pos
+    };
+
+    let position = saved
+        .and_then(|(x, y)| validate_popup_position(app, x, y))
+        .or_else(|| default_popup_position(app));
+
+    if let Some((x, y)) = position {
+        if let Err(e) = popup.set_position(PhysicalPosition::new(x, y)) {
+            log::warn!("Failed to set popup position: {e}");
+        }
+    }
+
+    if let Err(e) = popup.show() {
+        log::error!("Failed to show popup: {e}");
+        return;
+    }
+    if let Err(e) = popup.set_focus() {
+        log::warn!("Failed to focus popup: {e}");
+    }
+
+    // Trigger a data refresh when popup opens (if enabled)
+    if state.refresh_on_open.load(Ordering::Relaxed) {
+        state.refresh_notify.notify_one();
+    }
+
+    log::debug!("Popup shown at position {:?}", position);
+}
+
 /// Update tray icon based on usage level or error state
 pub fn update_tray_icon(app: &AppHandle, usage: &UsageResponse, error: Option<&str>) {
-    // Config is read-only, no lock needed
     let state: tauri::State<'_, Arc<AppState>> = app.state();
     let config = &state.config;
 
-    // Get icon name from usage/error state
     let icon_name = if error.is_some() {
         IconName::Error
     } else {
@@ -404,11 +414,8 @@ pub fn update_tray_icon(app: &AppHandle, usage: &UsageResponse, error: Option<&s
     };
 
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        // Try to get the requested icon, fall back to Loading icon on failure
         let icon = get_icon(icon_name).unwrap_or_else(|| {
-            log::error!(
-                "Failed to load icon '{icon_name:?}' from cache, falling back to default icon"
-            );
+            log::error!("Failed to load icon '{icon_name:?}', falling back to loading icon");
             get_icon(IconName::Loading).expect("Loading icon must be available")
         });
 
@@ -416,7 +423,6 @@ pub fn update_tray_icon(app: &AppHandle, usage: &UsageResponse, error: Option<&s
             log::error!("Failed to update tray icon: {e}");
         }
 
-        // Update tooltip with current usage or error
         let tooltip = if let Some(e) = error {
             format!("Error: {e}")
         } else {
@@ -430,12 +436,11 @@ pub fn update_tray_icon(app: &AppHandle, usage: &UsageResponse, error: Option<&s
     }
 }
 
-/// Update tray icon to error state without usage data (e.g., first launch failure)
+/// Update tray icon to error state without usage data
 pub fn update_tray_icon_error(app: &AppHandle, error: &str) {
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        // Try to get the error icon, fall back to Loading icon on failure
         let icon = get_icon(IconName::Error).unwrap_or_else(|| {
-            log::error!("Failed to load error icon from cache, falling back to default icon");
+            log::error!("Failed to load error icon, falling back to loading icon");
             get_icon(IconName::Loading).expect("Loading icon must be available")
         });
 
@@ -450,66 +455,37 @@ pub fn update_tray_icon_error(app: &AppHandle, error: &str) {
     }
 }
 
-/// Update tray menu with current usage
+/// Update tray menu with current settings state (usage shown in popup only).
 pub async fn update_tray_menu(app: &AppHandle) {
     let state: tauri::State<Arc<AppState>> = app.state();
 
-    // Get async state (separate lock acquisitions)
-    let usage = {
-        let latest_usage = state.latest_usage.read().await;
-        latest_usage.as_ref().map(Arc::clone)
-    };
     let error = {
         let last_error = state.last_error.read().await;
         last_error.clone()
     };
 
-    // Get last_checked (sync lock, brief hold)
-    // SAFETY: Mutex poisoning indicates a thread panicked while holding the lock.
-    // In UI update code, continuing with corrupted state could display incorrect information.
-    let last_checked = *state
-        .last_checked
-        .lock()
-        .expect("last_checked lock should not be poisoned");
-
-    // Config is read-only, no lock needed
-    let config = &state.config;
-
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
         return;
     };
 
-    // Create menu based on current state - prioritize errors even when cached usage exists
-    let menu = match (&usage, &error) {
-        (_, Some(e)) => {
-            let truncated = if e.chars().count() > DISPLAY_TOOLTIP_MAX_LENGTH {
-                format!(
-                    "{}...",
-                    e.chars()
-                        .take(DISPLAY_TOOLTIP_TRUNCATED_LENGTH)
-                        .collect::<String>()
-                )
-            } else {
-                e.clone()
-            };
-            let text = format!("Error: {truncated}");
-            let _ = tray.set_tooltip(Some(&text));
-            build_status_menu(app, &text, true)
+    let error_display = error.as_ref().map(|e| {
+        if e.chars().count() > DISPLAY_TOOLTIP_MAX_LENGTH {
+            format!(
+                "{}...",
+                e.chars()
+                    .take(DISPLAY_TOOLTIP_TRUNCATED_LENGTH)
+                    .collect::<String>()
+            )
+        } else {
+            e.clone()
         }
-        (Some(u), None) => {
-            let five_h = u.five_hour.as_ref().map_or(0.0, |w| w.utilization.as_f64());
-            let seven_d = u.seven_day.as_ref().map_or(0.0, |w| w.utilization.as_f64());
-            let tooltip = format!("Claude: 5h {five_h:.0}% | 7d {seven_d:.0}%");
-            let _ = tray.set_tooltip(Some(&tooltip));
-            build_usage_menu(app, u, last_checked, config)
-        }
-        (None, None) => {
-            let _ = tray.set_tooltip(Some("Loading..."));
-            build_status_menu(app, "Loading...", false)
-        }
-    };
+    });
 
-    if let Some(m) = menu {
+    if let Some(ref e) = error_display {
+        let _ = tray.set_tooltip(Some(&format!("Error: {e}")));
+    }
+
+    if let Some(m) = build_status_menu(app, error_display.as_deref()) {
         if let Err(e) = tray.set_menu(Some(m)) {
             log::error!("Failed to update tray menu: {e}");
         }
@@ -531,9 +507,6 @@ pub fn get_icon_name_for_usage(usage: &UsageResponse, config: &Config) -> IconNa
         seven_day_util
     );
 
-    // Convert usage levels to icon name using string construction
-    // Left char = 5-hour status, right char = 7-day status
-    // n=normal, w=warning, c=critical
     match (five_hour_level, seven_day_level) {
         (UsageLevel::Normal, UsageLevel::Normal) => IconName::Nn,
         (UsageLevel::Normal, UsageLevel::Warning) => IconName::Nw,
@@ -551,7 +524,92 @@ pub fn get_icon_name_for_usage(usage: &UsageResponse, config: &Config) -> IconNa
 // Private Functions
 // =============================================================================
 
-/// Create the "Refresh on open" menu item with checkmark indicator
+/// Validate that the given position is visible on at least one monitor.
+///
+/// Returns `Some((x, y))` if valid, `None` to trigger fallback to default position.
+fn validate_popup_position(app: &AppHandle, x: i32, y: i32) -> Option<(i32, i32)> {
+    let popup = app.get_webview_window("popup")?;
+    let monitors = popup.available_monitors().ok()?;
+
+    // Check that at least the top-left corner of the popup is on a monitor
+    let is_visible = monitors.iter().any(|m| {
+        let pos = m.position();
+        let size = m.size();
+        x >= pos.x
+            && x < pos.x + size.width as i32
+            && y >= pos.y
+            && y < pos.y + size.height as i32
+    });
+
+    if is_visible {
+        Some((x, y))
+    } else {
+        log::debug!("Saved popup position ({x}, {y}) is off-screen, using default");
+        None
+    }
+}
+
+/// Calculate the default popup position: bottom-right corner above the taskbar.
+///
+/// `inner_size` is specified in **logical** pixels; we must multiply by the monitor's
+/// scale factor to get the correct **physical** pixel offset for `set_position`.
+fn default_popup_position(app: &AppHandle) -> Option<(i32, i32)> {
+    let popup = app.get_webview_window("popup")?;
+    let monitor = popup.primary_monitor().ok()??;
+
+    let pos = monitor.position();
+    let size = monitor.size();
+    let scale = monitor.scale_factor();
+
+    // Convert logical dimensions → physical pixels
+    let popup_w = (f64::from(POPUP_WIDTH) * scale).round() as i32;
+    let popup_h = (f64::from(POPUP_HEIGHT) * scale).round() as i32;
+    let taskbar = (f64::from(TASKBAR_APPROX_PX) * scale).round() as i32;
+
+    const MARGIN: i32 = 4;
+
+    let x = pos.x + size.width as i32 - popup_w - MARGIN;
+    let y = pos.y + size.height as i32 - popup_h - taskbar - MARGIN;
+
+    Some((x.max(pos.x), y.max(pos.y)))
+}
+
+fn create_keep_window_open_menu_item(app: &AppHandle) -> Option<MenuItem<tauri::Wry>> {
+    let state: tauri::State<Arc<AppState>> = app.state();
+    let enabled = state.keep_window_open.load(Ordering::Relaxed);
+    let text = if enabled {
+        "  ✓ Keep window open"
+    } else {
+        "    Keep window open"
+    };
+    MenuItem::with_id(
+        app,
+        MenuId::KeepWindowOpen.as_str(),
+        text,
+        true,
+        None::<&str>,
+    )
+    .ok()
+}
+
+fn create_always_on_top_menu_item(app: &AppHandle) -> Option<MenuItem<tauri::Wry>> {
+    let state: tauri::State<Arc<AppState>> = app.state();
+    let enabled = state.always_on_top.load(Ordering::Relaxed);
+    let text = if enabled {
+        "  ✓ Always on top"
+    } else {
+        "    Always on top"
+    };
+    MenuItem::with_id(
+        app,
+        MenuId::AlwaysOnTop.as_str(),
+        text,
+        true,
+        None::<&str>,
+    )
+    .ok()
+}
+
 fn create_refresh_on_open_menu_item(app: &AppHandle) -> Option<MenuItem<tauri::Wry>> {
     let state: tauri::State<Arc<AppState>> = app.state();
     let enabled = state.refresh_on_open.load(Ordering::Relaxed);
@@ -570,12 +628,10 @@ fn create_refresh_on_open_menu_item(app: &AppHandle) -> Option<MenuItem<tauri::W
     .ok()
 }
 
-/// Check if start on login is enabled
 fn is_autostart_enabled(app: &AppHandle) -> bool {
     app.autolaunch().is_enabled().unwrap_or(false)
 }
 
-/// Create the autostart menu item with checkmark indicator
 fn create_autostart_menu_item(app: &AppHandle) -> Option<MenuItem<tauri::Wry>> {
     let autostart_enabled = is_autostart_enabled(app);
     let autostart_text = if autostart_enabled {
@@ -593,13 +649,9 @@ fn create_autostart_menu_item(app: &AppHandle) -> Option<MenuItem<tauri::Wry>> {
     .ok()
 }
 
-/// Get icon from cache by name, decoding all icons on first access
 fn get_icon(name: IconName) -> Option<Image<'static>> {
-    // Initialize cache first - ensures fallback path always works
     let cache = ICON_CACHE.get_or_init(|| {
         let mut map = HashMap::new();
-
-        // Precompute all icons at startup
         let icon_variants = [
             IconName::Nn,
             IconName::Nw,
@@ -613,7 +665,6 @@ fn get_icon(name: IconName) -> Option<Image<'static>> {
             IconName::Loading,
             IconName::Error,
         ];
-
         for name in icon_variants {
             match Image::from_bytes(name.bytes()) {
                 Ok(image) => {
@@ -624,47 +675,55 @@ fn get_icon(name: IconName) -> Option<Image<'static>> {
                 }
             }
         }
-
         map
     });
-
     cache.get(&name).cloned()
 }
 
-/// Helper to extract utilization from an optional `UsageWindow`
 fn get_utilization(window: Option<&crate::api::UsageWindow>) -> f64 {
     window.map_or(0.0, |w| w.utilization.as_f64())
 }
 
-/// Build a simple status menu (error/loading states)
-fn build_status_menu(app: &AppHandle, status_text: &str, show_reauth: bool) -> Option<Menu<tauri::Wry>> {
+/// Build the right-click context menu.
+///
+/// The header item is a clickable link to the GitHub repo.
+/// If `error` is `Some`, an error line and Re-authenticate item are inserted
+/// between the header and the settings items.
+fn build_status_menu(app: &AppHandle, error: Option<&str>) -> Option<Menu<tauri::Wry>> {
     use tauri::menu::PredefinedMenuItem;
 
+    // Clickable title → opens GitHub repo
     let header = MenuItem::with_id(
         app,
         MenuId::Header.as_str(),
-        " ━━ Claude Usage ━━ ",
-        false,
+        "  Claude Usage Tracker ↗",
+        true,
         None::<&str>,
     )
     .ok()?;
     let sep1 = PredefinedMenuItem::separator(app).ok()?;
-    let status =
-        MenuItem::with_id(app, MenuId::Status.as_str(), status_text, false, None::<&str>)
-            .ok()?;
-    let sep2 = PredefinedMenuItem::separator(app).ok()?;
+    let keep_window_open = create_keep_window_open_menu_item(app)?;
+    let always_on_top = create_always_on_top_menu_item(app)?;
     let autostart = create_autostart_menu_item(app)?;
     let refresh_on_open = create_refresh_on_open_menu_item(app)?;
-    let refresh =
-        MenuItem::with_id(app, MenuId::Refresh.as_str(), "  ↻ Refresh", true, None::<&str>)
-            .ok()?;
     let quit =
         MenuItem::with_id(app, MenuId::Quit.as_str(), "  Quit", true, None::<&str>).ok()?;
 
     let mut items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> =
-        vec![&header, &sep1, &status, &sep2, &autostart, &refresh_on_open];
+        vec![&header, &sep1];
 
-    let reauth = if show_reauth {
+    // Error state: show message + re-auth + extra separator before settings
+    let error_item = error.and_then(|e| {
+        MenuItem::with_id(
+            app,
+            MenuId::Status.as_str(),
+            &format!("  ⚠ {e}"),
+            false,
+            None::<&str>,
+        )
+        .ok()
+    });
+    let reauth = if error.is_some() {
         MenuItem::with_id(
             app,
             MenuId::Reauth.as_str(),
@@ -676,142 +735,26 @@ fn build_status_menu(app: &AppHandle, status_text: &str, show_reauth: bool) -> O
     } else {
         None
     };
-    if let Some(ref r) = reauth {
-        items.push(r);
-    }
-
-    items.push(&refresh);
-    items.push(&quit);
-
-    Menu::with_items(app, &items).ok()
-}
-
-/// Build a usage menu with current usage data
-fn build_usage_menu(
-    app: &AppHandle,
-    usage: &UsageResponse,
-    last_checked: Option<chrono::DateTime<chrono::Utc>>,
-    config: &Config,
-) -> Option<Menu<tauri::Wry>> {
-    use chrono::Local;
-    use tauri::menu::PredefinedMenuItem;
-
-    // Centered header (approximately centered for typical menu width ~30 chars)
-    let header = MenuItem::with_id(
-        app,
-        MenuId::Header.as_str(),
-        " ━━ Claude Usage ━━ ",
-        false,
-        None::<&str>,
-    )
-    .ok()?;
-    let sep1 = PredefinedMenuItem::separator(app).ok()?;
-
-    // Build formatted usage items with visual indicators
-    let item_5h = format_usage_item(
-        app,
-        usage.five_hour.as_ref(),
-        window_labels::FIVE_HOUR,
-        config,
-    );
-    let item_7d = format_usage_item(
-        app,
-        usage.seven_day.as_ref(),
-        window_labels::SEVEN_DAY,
-        config,
-    );
-    let item_opus = format_usage_item(
-        app,
-        usage.seven_day_opus.as_ref(),
-        window_labels::OPUS,
-        config,
-    );
-    let item_sonnet = format_usage_item(
-        app,
-        usage.seven_day_sonnet.as_ref(),
-        window_labels::SONNET,
-        config,
-    );
-
-    // Last checked time
-    let last_checked_text = last_checked.map_or_else(
-        || "  Last check: never".to_string(),
-        |ts| format!("  Last check: {}", ts.with_timezone(&Local).format("%H:%M")),
-    );
-    let item_last_checked = MenuItem::with_id(
-        app,
-        MenuId::LastChecked.as_str(),
-        &last_checked_text,
-        false,
-        None::<&str>,
-    )
-    .ok()?;
-
-    let sep2 = PredefinedMenuItem::separator(app).ok()?;
-
-    let autostart = create_autostart_menu_item(app)?;
-    let refresh_on_open = create_refresh_on_open_menu_item(app)?;
-    let refresh = MenuItem::with_id(
-        app,
-        MenuId::Refresh.as_str(),
-        "  ↻ Refresh",
-        true,
-        None::<&str>,
-    )
-    .ok()?;
-    let quit = MenuItem::with_id(app, MenuId::Quit.as_str(), "  Quit", true, None::<&str>).ok()?;
-
-    // Build menu items list - collect non-optional items
-    let mut items: Vec<&dyn tauri::menu::IsMenuItem<tauri::Wry>> = vec![&header, &sep1];
-
-    // Add each usage item if it exists
-    for i in [&item_5h, &item_7d, &item_opus, &item_sonnet]
-        .into_iter()
-        .flatten()
-    {
-        items.push(i);
-    }
-
-    items.push(&item_last_checked);
-    items.push(&sep2);
-    items.push(&autostart);
-    items.push(&refresh_on_open);
-    items.push(&refresh);
-    items.push(&quit);
-
-    Menu::with_items(app, &items).ok()
-}
-
-/// Format reset time as relative duration
-fn format_reset(reset_at: Option<&chrono::DateTime<chrono::Utc>>) -> String {
-    use chrono::Utc;
-
-    let Some(reset_time) = reset_at else {
-        return String::new();
+    let sep2 = if error.is_some() {
+        PredefinedMenuItem::separator(app).ok()
+    } else {
+        None
     };
 
-    let now = Utc::now();
-    let duration = reset_time.signed_duration_since(now);
+    if let Some(ref e) = error_item { items.push(e); }
+    if let Some(ref r) = reauth    { items.push(r); }
+    if let Some(ref s) = sep2      { items.push(s); }
 
-    if duration.num_seconds() <= 0 {
-        return " (resetting)".to_string();
-    }
+    items.push(&keep_window_open);
+    items.push(&always_on_top);
+    items.push(&autostart);
+    items.push(&refresh_on_open);
+    items.push(&quit);
 
-    let hours = duration.num_hours();
-    let minutes = duration.num_minutes() % DISPLAY_MINUTES_PER_HOUR;
-
-    if hours >= DISPLAY_HOURS_PER_DAY {
-        let days = hours / DISPLAY_HOURS_PER_DAY;
-        let rem_hours = hours % DISPLAY_HOURS_PER_DAY;
-        format!(" ({days}d {rem_hours}h)")
-    } else if hours > 0 {
-        format!(" ({hours}h {minutes}m)")
-    } else {
-        format!(" ({minutes}m)")
-    }
+    Menu::with_items(app, &items).ok()
 }
 
-/// Get visual indicator emoji based on usage percentage
+#[cfg(test)]
 fn get_usage_indicator(utilization: f64, config: &Config) -> &'static str {
     if config.is_above_critical(utilization) {
         "🔴"
@@ -820,61 +763,6 @@ fn get_usage_indicator(utilization: f64, config: &Config) -> &'static str {
     } else {
         "🟢"
     }
-}
-
-/// Create a visual progress bar using Unicode block characters
-fn make_progress_bar(utilization: f64, width: u8) -> String {
-    // Calculate filled portion using lossless f64::from(u8) conversion
-    let width_f64 = f64::from(width);
-    let filled_f64 = (utilization / 100.0 * width_f64)
-        .round()
-        .clamp(0.0, width_f64);
-    // Safe: clamped to 0..=width, which fits in u8
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let filled = filled_f64 as usize;
-    let empty = usize::from(width) - filled;
-
-    // Use block characters: █ for filled, ░ for empty
-    format!("{}{}", "█".repeat(filled), "░".repeat(empty))
-}
-
-/// Format a single usage item with visual styling
-fn format_usage_item(
-    app: &AppHandle,
-    window: Option<&crate::api::UsageWindow>,
-    label: &str,
-    config: &Config,
-) -> Option<tauri::menu::MenuItem<tauri::Wry>> {
-    let window = window?;
-    let util = window.utilization.as_f64();
-
-    // Fixed column positions for alignment
-    // Format: "  [LABEL    ] E 00.0% BARTEN...... (reset)"
-    //         ^  ^--------^ ^ ^----^ ^----------^
-    //         |  label(9)  sp perc  bar(10)
-
-    // Select appropriate indicator based on window type
-    // Opus/Sonnet use neutral indicator (no notifications, no icon influence per design decision)
-    let indicator = match label {
-        window_labels::OPUS | window_labels::SONNET => "⚪",
-        _ => get_usage_indicator(util, config),
-    };
-
-    let bar = make_progress_bar(util, DISPLAY_PROGRESS_BAR_WIDTH);
-    let reset = format_reset(window.resets_at.as_ref());
-
-    // Format label in fixed-width field
-    let text = format!("  [{label}] {indicator} {util:>5.1}% {bar}{reset}");
-
-    let id = match label {
-        window_labels::FIVE_HOUR => MenuId::Usage5h.as_str(),
-        window_labels::SEVEN_DAY => MenuId::Usage7d.as_str(),
-        window_labels::OPUS => MenuId::UsageOpus.as_str(),
-        window_labels::SONNET => MenuId::UsageSonnet.as_str(),
-        _ => MenuId::Status.as_str(),
-    };
-
-    MenuItem::with_id(app, id, &text, false, None::<&str>).ok()
 }
 
 // =============================================================================
@@ -886,7 +774,6 @@ mod tests {
     #![allow(dead_code)]
     use super::*;
 
-    /// Get the appropriate icon based on usage levels (split icon for 5h/7d)
     pub fn get_icon_for_usage(usage: &UsageResponse, config: &Config) -> bool {
         get_icon(get_icon_name_for_usage(usage, config)).is_some()
     }
@@ -898,7 +785,6 @@ mod tests {
 
         let config = Config::default();
 
-        // All 9 combinations should return valid icon names
         let combinations = [
             (Normal, Normal, IconName::Nn),
             (Normal, Warning, IconName::Nw),
@@ -924,7 +810,6 @@ mod tests {
                 seven_day_opus: None,
                 seven_day_sonnet: None,
             };
-            // Modify the usage levels by setting appropriate utilization values
             let usage = modify_usage_for_level(usage, five_h, seven_d);
             let icon_name = get_icon_name_for_usage(&usage, &config);
             assert_eq!(
@@ -934,7 +819,6 @@ mod tests {
         }
     }
 
-    // Helper to create UsageResponse with specific usage levels
     fn modify_usage_for_level(
         mut usage: UsageResponse,
         five_h: UsageLevel,
@@ -963,7 +847,6 @@ mod tests {
     #[test]
     fn test_get_usage_indicator_normal() {
         let config = Config::default();
-        // Below warning threshold (default 75%)
         assert_eq!(get_usage_indicator(50.0, &config), "🟢");
         assert_eq!(get_usage_indicator(0.0, &config), "🟢");
         assert_eq!(get_usage_indicator(74.9, &config), "🟢");
@@ -972,7 +855,6 @@ mod tests {
     #[test]
     fn test_get_usage_indicator_warning() {
         let config = Config::default();
-        // At or above warning (75%) but below critical (90%)
         assert_eq!(get_usage_indicator(75.0, &config), "🟡");
         assert_eq!(get_usage_indicator(80.0, &config), "🟡");
         assert_eq!(get_usage_indicator(89.9, &config), "🟡");
@@ -981,7 +863,6 @@ mod tests {
     #[test]
     fn test_get_usage_indicator_critical() {
         let config = Config::default();
-        // At or above critical threshold (default 90%)
         assert_eq!(get_usage_indicator(90.0, &config), "🔴");
         assert_eq!(get_usage_indicator(95.0, &config), "🔴");
         assert_eq!(get_usage_indicator(100.0, &config), "🔴");
@@ -996,14 +877,9 @@ mod tests {
             ..Default::default()
         };
 
-        // Below warning
         assert_eq!(get_usage_indicator(50.0, &config), "🟢");
-
-        // At warning but below critical
         assert_eq!(get_usage_indicator(60.0, &config), "🟡");
         assert_eq!(get_usage_indicator(80.0, &config), "🟡");
-
-        // At critical
         assert_eq!(get_usage_indicator(85.0, &config), "🔴");
         assert_eq!(get_usage_indicator(95.0, &config), "🔴");
     }
@@ -1011,10 +887,25 @@ mod tests {
     #[test]
     fn test_get_usage_indicator_edge_values() {
         let config = Config::default();
-        // Negative values should be treated as normal (below all thresholds)
         assert_eq!(get_usage_indicator(-1.0, &config), "🟢");
         assert_eq!(get_usage_indicator(-100.0, &config), "🟢");
-        // Values above 100% should still be critical
         assert_eq!(get_usage_indicator(150.0, &config), "🔴");
+    }
+
+    #[test]
+    fn test_menu_id_roundtrip() {
+        use std::str::FromStr;
+        let ids = [
+            MenuId::KeepWindowOpen,
+            MenuId::AlwaysOnTop,
+            MenuId::StartOnLogin,
+            MenuId::RefreshOnOpen,
+            MenuId::Quit,
+        ];
+        for id in ids {
+            let s = id.as_str();
+            let parsed = MenuId::from_str(s).expect("should parse");
+            assert_eq!(parsed, id);
+        }
     }
 }

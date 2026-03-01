@@ -5,7 +5,7 @@
 Claude Usage Tracker is a Tauri 2.x system tray application that monitors Claude Code API usage and displays status via a color-coded split icon with desktop notifications. The application polls the OAuth usage endpoint every 2 minutes (with jitter), displays real-time status in the system tray, and sends notifications when usage thresholds are exceeded.
 
 **Key characteristics:**
-- **Pure Rust** - No frontend JavaScript, tray-only application
+- **Rust + HTML/JS popup** - Rust backend with a decorationless WebView popup window for usage display
 - **Async-first** - Tokio-based polling with event-driven architecture
 - **Type-safe** - Strong typing with newtypes (`Percentage`, `Utilization`) and comprehensive error handling
 - **Event-driven** - Service layer emits events, UI responds asynchronously
@@ -16,64 +16,83 @@ Claude Usage Tracker is a Tauri 2.x system tray application that monitors Claude
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                           main.rs                               │
-│  (Entry point, thin wiring layer)                              │
+│  (Entry point, thin wiring layer)                               │
 │                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐  │
-│  │ AppState                                                │  │
-│  │ ├─ latest_usage: RwLock<Option<Arc<UsageResponse>>>    │  │
-│  │ ├─ last_error: RwLock<Option<String>>                  │  │
-│  │ ├─ notification_state: RwLock<NotificationState>       │  │
-│  │ ├─ last_checked: Mutex<Option<DateTime>>              │  │
-│  │ ├─ refresh_notify: Notify                              │  │
-│  │ ├─ credentials: Mutex<Option<Arc<Credentials>>>       │  │
-│  │ ├─ cancel_token: CancellationToken                     │  │
-│  │ ├─ config: Config (read-only)                          │  │
-│  │ └─ http_client: reqwest::Client                        │  │
-│  └─────────────────────────────────────────────────────────┘  │
-└──────────────┬──────────────────────┬──────────────────────────┘
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │ AppState                                                │    │
+│  │ ├─ latest_usage: RwLock<Option<Arc<UsageResponse>>>     │    │
+│  │ ├─ last_error: RwLock<Option<String>>                   │    │
+│  │ ├─ notification_state: RwLock<NotificationState>        │    │
+│  │ ├─ last_checked: Mutex<Option<DateTime>>                │    │
+│  │ ├─ refresh_notify: Notify                               │    │
+│  │ ├─ credentials: Mutex<Option<Arc<Credentials>>>         │    │
+│  │ ├─ cancel_token: CancellationToken                      │    │
+│  │ ├─ config: Config (read-only)                           │    │
+│  │ ├─ http_client: reqwest::Client                         │    │
+│  │ ├─ keep_window_open: AtomicBool                         │    │
+│  │ ├─ always_on_top: AtomicBool                            │    │
+│  │ ├─ refresh_on_open: AtomicBool                          │    │
+│  │ └─ window_position: Mutex<Option<(i32, i32)>>           │    │
+│  └─────────────────────────────────────────────────────────┘    │
+└──────────────┬──────────────────────┬───────────────────────────┘
                │                      │
                │ spawns               │ uses
                v                      v
-┌──────────────┴──────────┐  ┌────────┴──────────┐
+┌──────────────┴──────────┐  ┌────────┴───────────┐
 │    service.rs           │  │    api.rs          │
 │ (polling_loop)          │  │ (HTTP client,      │
-│                          │  │  retry logic)      │
+│                         │  │  retry logic)      │
 │ • polling_loop          │  │ • build_http_client│
 │ • credential refresh    │  │ • fetch_usage      │
-│                          │  │ • Exponential      │
+│                         │  │ • Exponential      │
 └──────────────┬──────────┘  │   backoff + jitter │
                │             └────────┬───────────┘
                │                      │ calls
                │ uses                 v
                │              ┌───────┴────────┐
-               └──────────────┤  Claude API     │
-                              │  (OAuth usage   │
-                              │   endpoint)     │
-                              └─────────────────┘
+               └──────────────┤  Claude API    │
+                              │  (OAuth usage  │
+                              │   endpoint)    │
+                              └────────────────┘
 
                │ events (AppEvent from events.rs)
                │ via mpsc channel
                v
 ┌──────────────┴──────────┐  ┌────────┴──────────┐
 │    tray.rs              │  │    config.rs      │
-│ (icon, menu)            │  │ (validation,      │
-│                          │  │  thresholds)      │
-│ • create_tray           │  │                    │
-│ • update_tray_icon      │  │ • Percentage      │
-│ • update_tray_menu      │  │ • Config          │
-│ • UsageLevel enum       │  │ • ConfigError     │
+│ (icon, menu, popup pos) │  │ (validation,      │
+│                         │  │  thresholds)      │
+│ • create_tray           │  │                   │
+│ • show_popup (toggle)   │  │ • Percentage      │
+│ • update_tray_icon      │  │ • Config          │
+│ • update_tray_menu      │  │ • ConfigError     │
+│ • UsageLevel enum       │  │                   │
 └──────────────┬──────────┘  └────────┬──────────┘
+               │
+               │ Tauri commands / events
+               v
+┌──────────────┴──────────┐
+│    commands.rs          │
+│ (popup ↔ Rust bridge)   │
+│                         │
+│ • get_usage_data        │
+│ • trigger_refresh       │
+│ • save_window_position  │
+│ • hide_popup            │
+│ • open_github           │
+│ • UsageDto / WindowDto  │
+└─────────────────────────┘
                │                      │
                │ uses                 │ reads
                v                      v
 ┌──────────────┴──────────┐  ┌────────┴──────────┐
 │    auth.rs              │  │  events.rs        │
 │ (credentials)           │  │ (event types)     │
-│                          │  │                    │
-│ • load_credentials      │  │ • AppEvent         │
-│ • get_credentials_path  │  │ • Credential       │
-│ • minutes_until_expiry  │  │   RefreshResult    │
-│ • AuthContextError      │  │                    │
+│                         │  │                   │
+│ • load_credentials      │  │ • AppEvent        │
+│ • get_credentials_path  │  │ • Credential      │
+│ • minutes_until_expiry  │  │   RefreshResult   │
+│ • AuthContextError      │  │                   │
 └──────────────┬──────────┘  └────────┬──────────┘
                │                      │
                v                      v
@@ -105,23 +124,23 @@ polling_loop (service.rs)
  │   └─ Check ~/.claude/.credentials.json
  ├─ Main polling cycle
  │   ├─ Wait for interval (2 minutes ± jitter)
- │   └─ User refresh triggered ───┐
- ├─ Fetch usage data              │
- │   ├─ Get credentials           │
- │   ├─ api::fetch_usage          │
- │   │   └─ Exponential backoff   │
- │   │       with retry (max 3)   │
- │   ├─ On success:               │
- │   │   ├─ Update usage data     │
- │   │   ├─ Check notifications   │
- │   │   └─ Emit UsageUpdated     │
- │   ├─ On 401 Unauthorized:      │
- │   │   ├─ Attempt credential    │
- │   │   │   refresh              │
+ │   └─ User refresh triggered ─────┐
+ ├─ Fetch usage data                │
+ │   ├─ Get credentials             │
+ │   ├─ api::fetch_usage            │
+ │   │   └─ Exponential backoff     │
+ │   │       with retry (max 3)     │
+ │   ├─ On success:                 │
+ │   │   ├─ Update usage data       │
+ │   │   ├─ Check notifications     │
+ │   │   └─ Emit UsageUpdated       │
+ │   ├─ On 401 Unauthorized:        │
+ │   │   ├─ Attempt credential      │
+ │   │   │   refresh                │
  │   │   └─ Emit CredentialsExpired │
- │   └─ On other errors:          │
- │       ├─ Log error             │
- │       └─ Emit ErrorOccurred    │
+ │   └─ On other errors:            │
+ │       ├─ Log error               │
+ │       └─ Emit ErrorOccurred      │
  └─ On shutdown
      └─ Cancel all tasks
 ```
@@ -144,7 +163,8 @@ handle_successful_fetch()
          │   │   └─ Send notification if needed
          │   └─ Opus/Sonnet skipped (no notifications)
          ├─ update_tray_icon
-         └─ update_tray_menu
+         ├─ update_tray_menu
+         └─ app.emit("usage-updated", UsageDto) → popup WebView
 ```
 
 ### 4. Error Handling Path
@@ -184,7 +204,13 @@ pub struct AppState {
     // Sync locks for fields accessed in Tauri callbacks
     pub last_checked: Mutex<Option<DateTime<Utc>>>,
     pub credentials: Mutex<Option<Arc<Credentials>>>,
+    pub window_position: Mutex<Option<(i32, i32)>>,
     pub cancel_token: CancellationToken,
+
+    // Atomic flags (lock-free, accessed from both sync and async contexts)
+    pub keep_window_open: AtomicBool,
+    pub always_on_top: AtomicBool,
+    pub refresh_on_open: AtomicBool,
 
     // No lock for read-only fields
     pub config: Config,
@@ -206,14 +232,14 @@ Three-tier threshold system with hysteresis:
 
 ```
 0% ─────┬────── 50% ─────┬────── 75% ─────┬────── 100%
-        │                 │                  │
-        │                 │                  │
-        └──── RESET       │                  │
-                          │                  │
-                          ├──── WARNING ─────┤
-                          │                  │
-                          │                  │
-                          └──── CRITICAL ────┘
+        │                │                │
+        │                │                │
+        └──── RESET      │                │
+                         │                │
+                         ├─── WARNING ────┤
+                         │                │
+                         │                │
+                         └─── CRITICAL ───┘
 ```
 
 **Threshold values:**
@@ -340,22 +366,22 @@ pub fn load() -> anyhow::Result<Config> {
        ├─ Unauthorized (401) ──┐
        │                       │
        v                       │
-┌─────────────────────┐       │
-│ Credential Refresh  │       │
-│ (load from disk)    │       │
-└──────┬──────────────┘       │
-       │                      │
-       ├─ Token changed ──────┼─> Retry fetch
-       │                      │
-       └─ Token unchanged/    │
-         Failed to load ──────┤
+┌─────────────────────┐        │
+│ Credential Refresh  │        │
+│ (load from disk)    │        │
+└──────┬──────────────┘        │
+       │                       │
+       ├─ Token changed ───────┼─> Retry fetch
+       │                       │
+       └─ Token unchanged/     │
+         Failed to load ───────┤
                                │
 ┌──────────────────────────────┘
 │
 v
-┌─────────────┐
+┌────────────────────────┐
 │Emit CredentialsExpired │
-└─────────────┘
+└────────────────────────┘
 
 ┌─────────────┐
 │  Polling    │
@@ -367,9 +393,9 @@ v
                 │
                 v
 ┌───────────────────────────────┐
-│ API Layer Retry              │
+│ API Layer Retry               │
 │ (exponential backoff + jitter)│
-│ Max 3 retries, then fail     │
+│ Max 3 retries, then fail      │
 └───────────┬───────────────────┘
             │
             ├─ Success ─────────> Continue polling

@@ -86,17 +86,18 @@ sudo pacman -S webkit2gtk-4.1 libayatana-appindicator
 
 ## Architecture
 
-This is a **Tauri 2.x** system tray application (no window) that monitors Claude Code API usage. It's a pure Rust application with no frontend JavaScript.
+This is a **Tauri 2.x** system tray application that monitors Claude Code API usage. It has a decorationless **popup window** (HTML/JS frontend) that opens on left-click and a settings context menu on right-click.
 
 ### Module Structure
 
 - **main.rs** - Entry point and thin wiring layer. Sets up Tauri, spawns the polling service and event handler tasks.
-- **lib.rs** - Module declarations and `AppState` struct. Re-exports `Config` and `Credentials`.
+- **lib.rs** - Module declarations, `AppState` struct, popup window creation, and `event_handler_loop`. Re-exports `Config` and `Credentials`.
+- **commands.rs** - Tauri commands exposed to the popup frontend: `get_usage_data`, `trigger_refresh`, `save_window_position`, `hide_popup`, `open_github`. Also contains `UsageDto`/`WindowDto` and `build_usage_dto()`.
 - **events.rs** - Event types for service-to-application communication: `AppEvent` enum and `CredentialRefreshResult`.
 - **service.rs** - Core service layer: polling logic (`polling_loop`), notification state management (`NotificationState`, `check_window_notification`), credential refresh handling, and cooldown logic. Framework-agnostic, emits `AppEvent` messages.
 - **auth.rs** - Reads credentials from `~/.claude/.credentials.json`. Provides `load_credentials()` and `Credentials` struct.
 - **api.rs** - HTTP client for Claude usage API. Returns `UsageResponse` with 5-hour, 7-day, and 7-day Opus/Sonnet utilization windows. Includes retry logic with exponential backoff.
-- **tray.rs** - System tray icon, menu management, and `MenuId` enum for menu event handling.
+- **tray.rs** - System tray icon, menu management, popup positioning, and `MenuId` enum for menu event handling.
 - **config.rs** - Simplified flat configuration with 5 fields: thresholds (warning/critical/reset) and intervals (polling/notification cooldown).
 
 ### Configuration System
@@ -160,6 +161,10 @@ This design keeps the service layer framework-agnostic (no Tauri dependencies) w
   - `cancel_token: CancellationToken` - Shutdown coordination
   - `config: Config` - Read-only after startup (no lock needed)
   - `http_client: reqwest::Client` - Owned directly (no OnceLock)
+  - `keep_window_open: AtomicBool` - Prevents popup auto-close on focus loss
+  - `always_on_top: AtomicBool` - Keeps popup above all other windows
+  - `refresh_on_open: AtomicBool` - Triggers data refresh when popup opens
+  - `window_position: Mutex<Option<(i32, i32)>>` - Persisted popup position (physical pixels)
 
 **Service Layer Types:**
 - `AppEvent` - Events from service to application layer:
@@ -189,10 +194,11 @@ This design keeps the service layer framework-agnostic (no Tauri dependencies) w
 ### Tauri Configuration
 
 - Uses Tauri 2.x with `tauri.conf.json` (not `tauri.conf.json5`)
-- No windows defined - tray-only app
-- Minimal `dist/` directory with placeholder `index.html` (required by Tauri even for tray-only apps)
+- One popup window (`"popup"`, 290×140 logical px) created programmatically in `setup()` — hidden by default, shown on tray left-click
+- `dist/index.html` — full popup UI (dark Catppuccin theme, HTML/JS with `withGlobalTauri: true`)
+- `security.csp: null` — required for Tauri IPC script injection in the WebView
 - Plugins: `tauri-plugin-notification`, `tauri-plugin-autostart`, `tauri-plugin-log`
-- Capabilities defined in `capabilities/default.json`
+- Capabilities defined in `capabilities/default.json` with `"windows": ["*"]` so permissions apply to the popup window too
 
 ### Split Icon System
 

@@ -8,6 +8,11 @@
 > - **Fixed duplicate tray icon**: Removed the static icon declaration from `tauri.conf.json` that caused a second icon to appear alongside the dynamic one
 > - **Re-authenticate button**: When authentication fails, a "⟳ Re-authenticate" button appears in the tray menu that launches `claude auth login` automatically
 > - **Refresh on open toggle**: A "Refresh on open" option in the tray menu controls whether clicking the tray icon triggers a data refresh
+> - **Custom popup window**: Left-click on the tray icon opens a compact popup (instead of a native menu) showing 5h, 7d, Opus and Sonnet usage with color-coded progress bars and time until reset per window. Clicking the tray icon again closes it (toggle).
+> - **Draggable popup with persisted position**: The popup can be freely repositioned; the position is saved and restored across sessions. Defaults to just above the taskbar in the bottom-right corner.
+> - **Auto-close on focus loss**: The popup hides automatically when it loses focus. Enable "Keep window open" in the right-click menu to prevent this.
+> - **Always on top**: Optional "Always on top" toggle in the right-click menu keeps the popup above all other windows.
+> - **Usage display moved to popup**: The right-click menu no longer shows usage data — all usage information is in the popup instead. The menu title links to this repository.
 
 ---
 
@@ -28,11 +33,12 @@ A lightweight **cross-platform** system tray application for monitoring your Cla
 
 ## Screenshots
 
-| High Usage | Low Usage |
-|------------|-----------|
-| ![High usage example](screenshots/menu-high-usage.png) | ![Low usage example](screenshots/menu-low-usage.png) |
+| Popup window | Context window |
+|--------------|----------------|
+| ![Popup window example](screenshots/popup.png) | ![Context window example](screenshots/context.png) |
 
-The tray menu displays usage for each time window with visual progress bars, color-coded status indicators, and time until reset.
+The popup window displays usage for each time window with visual progress bars, color-coded status indicators, and time until reset. It has a button to refresh data and close button if the 'Keep window open' option is on.
+The context window holds a link to the github repository and shows options.
 
 ## Prerequisites
 

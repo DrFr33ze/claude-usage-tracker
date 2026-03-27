@@ -11,3 +11,6 @@ scripts
 # Davia
 .davia/
 .claude/skills/davia-documentation/SKILL.md
+
+# Claude Code local settings
+.claude/settings.local.json

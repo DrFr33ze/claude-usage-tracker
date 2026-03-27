@@ -15,7 +15,7 @@ jobs:
         include:
           - platform: 'ubuntu-latest'
             args: ''
-          - platform: 'macos-latest'
+          - platform: 'macos-13'
             args: '--target universal-apple-darwin'
           - platform: 'windows-latest'
             args: ''
@@ -23,6 +23,8 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
       - name: Install dependencies (Ubuntu)
         if: matrix.platform == 'ubuntu-latest'

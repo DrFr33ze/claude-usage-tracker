@@ -191,16 +191,15 @@ impl IconName {
 pub fn create_tray(app: &AppHandle) -> Result<TrayIcon, tauri::Error> {
     let graceful_delay_ms = TIMING_GRACEFUL_SHUTDOWN_DELAY_MS;
 
-    let quit_item = MenuItem::with_id(app, MenuId::Quit.as_str(), "Quit", true, None::<&str>)?;
-    let loading_item = MenuItem::with_id(
-        app,
-        MenuId::Status.as_str(),
-        "Loading...",
-        false,
-        None::<&str>,
-    )?;
-
-    let menu = Menu::with_items(app, &[&loading_item, &quit_item])?;
+    // Build the full settings menu immediately so the user sees all options
+    // (including Re-authenticate if an error is already present) from the first
+    // right-click, without having to wait for the first poll event.
+    // Fall back to a minimal menu only if menu construction unexpectedly fails.
+    let menu = build_status_menu(app, None).unwrap_or_else(|| {
+        let quit = MenuItem::with_id(app, MenuId::Quit.as_str(), "Quit", true, None::<&str>)
+            .expect("quit menu item must be creatable");
+        Menu::with_items(app, &[&quit]).expect("minimal fallback menu must be creatable")
+    });
 
     let icon = get_icon(IconName::Loading).expect("loading icon must decode");
 

@@ -32,9 +32,6 @@ use service::{
     check_window_notification, NotificationAction, NotificationState, PendingStateChange,
 };
 
-// Timing and exit code constants
-const NOTIFICATION_DISPLAY_DELAY_MS: u64 = 500;
-const EXIT_CODE_ERROR: i32 = 1;
 
 /// Application state shared across components.
 ///
@@ -197,29 +194,14 @@ pub fn run() -> Result<()> {
                 event_handler_loop(&handle_for_events, event_rx).await;
             });
 
-            // Spawn async tray creation
-            let handle2 = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                if let Err(e) = tray::create_tray(&handle2) {
-                    log::error!("Failed to create tray: {e}");
-                    if let Err(notify_err) = handle2
-                        .notification()
-                        .builder()
-                        .title("Claude Usage - Startup Error")
-                        .body(format!(
-                            "Failed to create system tray: {e}. The app will exit."
-                        ))
-                        .show()
-                    {
-                        log::error!("Failed to show startup error notification: {notify_err}");
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        NOTIFICATION_DISPLAY_DELAY_MS,
-                    ))
-                    .await;
-                    handle2.exit(EXIT_CODE_ERROR);
-                }
-            });
+            // Create tray synchronously before spawning the polling task.
+            // This eliminates the race condition where update_tray_menu() could be
+            // called (on the first AuthRequired/ErrorOccurred event) before the tray
+            // even exists, causing the menu update to be silently dropped.
+            if let Err(e) = tray::create_tray(app.handle()) {
+                log::error!("Failed to create tray: {e}");
+                return Err(e.into());
+            }
 
             // Spawn polling task
             let state_clone = app_state.clone();

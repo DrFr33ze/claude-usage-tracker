@@ -21,10 +21,19 @@ use crate::config::Config;
 // =============================================================================
 
 const TIMING_JITTER_RANGE_SECS: i64 = 30;
-const TIMING_MIN_POLLING_INTERVAL_SECS: u64 = 60;
+const TIMING_MIN_POLLING_INTERVAL_SECS: u64 = 10;
 const TIMING_DEFAULT_RATE_LIMIT_BACKOFF_SECS: u64 = 300; // 5 minutes
 const TIMING_SECONDS_PER_MINUTE: u64 = 60;
 const AUTH_CHECK_INTERVAL_SECS: u64 = 30;
+/// Delay before retrying after a credential change to avoid a rapid 401 loop
+/// when the Claude CLI is actively refreshing tokens concurrently.
+const AUTH_RETRY_DELAY_SECS: u64 = 5;
+/// After this many consecutive 401s (even with credential changes) we give up
+/// and wait for manual re-authentication instead of hammering the API.
+const MAX_CONSECUTIVE_AUTH_RETRIES: u32 = 3;
+/// Minimum seconds between two manual refreshes (popup-open or Refresh button).
+/// Prevents accidental bursts from opening/closing the popup or rapid clicking.
+const TIMING_MIN_MANUAL_REFRESH_INTERVAL_SECS: u64 = 30;
 
 // =============================================================================
 // Types
@@ -400,6 +409,18 @@ pub async fn polling_loop(
         Instant::now() + Duration::from_secs(AUTH_CHECK_INTERVAL_SECS)
     };
 
+    // Tracks consecutive 401 failures to prevent rapid credential-refresh loops.
+    let mut consecutive_auth_failures: u32 = 0;
+
+    // When Some(t), we are in a 429 Retry-After window and should not poll
+    // (auto or manual) until Instant::now() >= t.
+    let mut rate_limit_until: Option<Instant> = None;
+
+    // Tracks when we last actually executed a poll so we can rate-limit manual
+    // refreshes (popup open / Refresh button) to at most once per
+    // TIMING_MIN_MANUAL_REFRESH_INTERVAL_SECS seconds.
+    let mut last_poll_instant: Option<Instant> = None;
+
     // Store notified future BEFORE entering loop to capture early signals
     let mut notified = std::pin::pin!(state.refresh_notify.notified());
 
@@ -413,14 +434,30 @@ pub async fn polling_loop(
                 break;
             }
 
-            // Manual refresh requested
+            // Manual refresh requested (popup open or Refresh button)
             () = &mut notified => {
-                log::debug!("Manual refresh requested");
                 // Re-arm for next signal
                 notified.set(state.refresh_notify.notified());
-                if has_credentials {
-                    // Poll immediately
-                    next_poll = do_poll(&sender, &state, &mut has_credentials).await;
+
+                // Suppress manual refresh while inside a 429 Retry-After window.
+                let in_rate_limit_window = rate_limit_until
+                    .map_or(false, |t| Instant::now() < t);
+
+                // Also rate-limit to avoid bursts from opening/closing the popup
+                // rapidly or hammering the Refresh button.
+                let too_soon = last_poll_instant
+                    .map_or(false, |t| {
+                        t.elapsed() < Duration::from_secs(TIMING_MIN_MANUAL_REFRESH_INTERVAL_SECS)
+                    });
+
+                if in_rate_limit_window {
+                    log::debug!("Manual refresh skipped: inside 429 Retry-After window");
+                } else if too_soon {
+                    log::debug!("Manual refresh skipped: polled less than {TIMING_MIN_MANUAL_REFRESH_INTERVAL_SECS}s ago");
+                } else if has_credentials {
+                    log::debug!("Manual refresh requested");
+                    next_poll = do_poll(&sender, &state, &mut has_credentials, &mut consecutive_auth_failures, &mut rate_limit_until).await;
+                    last_poll_instant = Some(Instant::now());
                 } else {
                     // Try to reload credentials
                     has_credentials = try_reload_credentials(&state).await;
@@ -433,7 +470,8 @@ pub async fn polling_loop(
             // Regular interval elapsed
             () = tokio::time::sleep(sleep_duration) => {
                 if has_credentials {
-                    next_poll = do_poll(&sender, &state, &mut has_credentials).await;
+                    next_poll = do_poll(&sender, &state, &mut has_credentials, &mut consecutive_auth_failures, &mut rate_limit_until).await;
+                    last_poll_instant = Some(Instant::now());
                 } else {
                     // Waiting for auth - try to reload credentials periodically
                     has_credentials = try_reload_credentials(&state).await;
@@ -501,28 +539,59 @@ async fn try_reload_credentials(state: &Arc<crate::AppState>) -> bool {
 }
 
 /// Perform a poll and return the next poll time.
+///
+/// `consecutive_auth_failures` is incremented on each 401 and reset to zero on
+/// success.  After `MAX_CONSECUTIVE_AUTH_RETRIES` failures we stop retrying
+/// quickly to avoid hammering the API while the Claude CLI refreshes tokens.
 async fn do_poll(
     sender: &mpsc::Sender<AppEvent>,
     state: &Arc<crate::AppState>,
     has_credentials: &mut bool,
+    consecutive_auth_failures: &mut u32,
+    rate_limit_until: &mut Option<Instant>,
 ) -> Instant {
     let result = do_fetch(sender, state).await;
 
     match result {
-        Ok(()) => calculate_next_poll(&state.config),
+        Ok(()) => {
+            *consecutive_auth_failures = 0;
+            *rate_limit_until = None;
+            calculate_next_poll(&state.config)
+        }
         Err(ApiError::RateLimited { retry_after }) => {
-            calculate_next_poll_with_retry_after(retry_after)
+            let next = calculate_next_poll_with_retry_after(retry_after);
+            // Record the window during which manual refreshes should be suppressed
+            *rate_limit_until = Some(next);
+            next
         }
         Err(ApiError::Unauthorized) => {
+            *consecutive_auth_failures += 1;
             // Try to refresh credentials
             let refresh_result = handle_unauthorized_error(sender, &state.credentials).await;
             match refresh_result {
-                CredentialRefreshResult::Changed => {
-                    // Retry immediately with new credentials
-                    Instant::now()
+                CredentialRefreshResult::Changed
+                    if *consecutive_auth_failures <= MAX_CONSECUTIVE_AUTH_RETRIES =>
+                {
+                    // Credentials changed — retry after a short delay instead of immediately.
+                    // Without this delay, a concurrent Claude CLI token refresh can create
+                    // a rapid 401 → reload (changed) → 401 loop that triggers API rate limits.
+                    log::debug!(
+                        "Credentials changed (attempt {}/{}), retrying in {}s",
+                        consecutive_auth_failures,
+                        MAX_CONSECUTIVE_AUTH_RETRIES,
+                        AUTH_RETRY_DELAY_SECS
+                    );
+                    Instant::now() + Duration::from_secs(AUTH_RETRY_DELAY_SECS)
                 }
-                CredentialRefreshResult::Unchanged | CredentialRefreshResult::Failed => {
-                    // Need user to re-authenticate
+                _ => {
+                    // Credentials unchanged/failed, or too many consecutive failures.
+                    // Wait for user to re-authenticate manually.
+                    if *consecutive_auth_failures > MAX_CONSECUTIVE_AUTH_RETRIES {
+                        log::warn!(
+                            "Giving up credential refresh after {} consecutive 401 errors",
+                            consecutive_auth_failures
+                        );
+                    }
                     *has_credentials = false;
                     Instant::now() + Duration::from_secs(AUTH_CHECK_INTERVAL_SECS)
                 }
@@ -603,11 +672,17 @@ async fn handle_fetch_error(
         log::warn!("Failed to fetch usage (401) - will attempt credential refresh");
         // Don't send ErrorOccurred for 401 - it's handled specially in do_poll()
         return;
-    } else if matches!(error, ApiError::RateLimited { .. }) {
-        log::warn!("Rate limited (429) - will retry after backoff");
-    } else {
-        log::error!("Failed to fetch usage: {error}");
     }
+    if let ApiError::RateLimited { retry_after } = error {
+        // Silently respect the rate limit - no error shown to the user.
+        // do_poll() will schedule the next attempt after the Retry-After delay.
+        log::warn!(
+            "Rate limited (429) - retrying after {} seconds",
+            retry_after.map_or(TIMING_DEFAULT_RATE_LIMIT_BACKOFF_SECS, |s| s)
+        );
+        return;
+    }
+    log::error!("Failed to fetch usage: {error}");
 
     let error_msg = format!("{error}");
 

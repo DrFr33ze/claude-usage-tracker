@@ -111,9 +111,8 @@ main()
  ├─ Load credentials (auth::load_credentials)
  ├─ Build HTTP client (api::build_http_client)
  ├─ Create AppState
- ├─ Create tray (tray::create_tray)
- ├─ Spawn polling_loop task
- └─ Spawn tray_update_loop task
+ ├─ Create tray (tray::create_tray)  ← synchronous, before polling starts
+ └─ Spawn polling_loop task
 ```
 
 ### 2. Polling Loop (Async)
@@ -145,7 +144,7 @@ polling_loop (service.rs)
      └─ Cancel all tasks
 ```
 
-**Note:** Retry and rate limit backoff are handled within `api::fetch_usage()` using exponential backoff.
+**Note:** Exponential backoff for transient errors (5xx, network) is handled within `api::fetch_usage()`. Rate limiting (429) is handled at the service layer: the error is suppressed silently and the next poll is scheduled after the `Retry-After` delay.
 
 ### 3. Successful Fetch Path
 
@@ -171,12 +170,15 @@ handle_successful_fetch()
 
 ```
 handle_fetch_error()
- ├─ Log at appropriate level
- ├─ Update last_error (direct RwLock)
- ├─ Send AppEvent::ErrorOccurred
- │   └─ event_handler_loop (main.rs)
- │       ├─ update_tray_icon_error
- │       └─ update_tray_menu
+ ├─ 401 Unauthorized → return early (handled by do_poll credential refresh)
+ ├─ 429 Rate Limited → return early (silent; do_poll reschedules after Retry-After)
+ └─ All other errors:
+     ├─ Log at appropriate level
+     ├─ Update last_error (direct RwLock)
+     └─ Send AppEvent::ErrorOccurred
+         └─ event_handler_loop (lib.rs)
+             ├─ update_tray_icon_error
+             └─ update_tray_menu
 ```
 
 ### 5. Manual Refresh Flow
@@ -341,7 +343,7 @@ pub fn load() -> anyhow::Result<Config> {
 #### Rate Limiting
 - `ApiError::RateLimited` - 429 with optional retry-after
 
-**Handling:** API layer handles rate limiting with exponential backoff based on Retry-After header.
+**Handling:** Handled silently at the service layer — no error shown to the user, no `ErrorOccurred` event emitted. `do_poll` schedules the next attempt after the `Retry-After` delay (default 5 minutes if header absent). Manual refreshes are suppressed while inside the rate-limit window.
 
 #### User Action Required (No retry)
 - `ApiError::Unauthorized` - 401 token expired
@@ -822,7 +824,7 @@ fn calculate_retry_delay(attempt: u32) -> u64 {
 - **Total**: < 2MB RSS
 
 ### CPU
-- **Polling loop**: 99% idle time (sleeps 2min ± 30s jitter)
+- **Polling loop**: 99% idle time (sleeps 2min ± 30s jitter, minimum 10s floor)
 - **API fetch**: ~100-500ms (depending on network)
 - **Tray updates**: ~10-50ms (icon swap + menu rebuild)
 - **Average**: Near-zero CPU when idle

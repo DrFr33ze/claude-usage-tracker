@@ -228,7 +228,7 @@ The tray icon shows both windows: left half = 5-hour, right half = 7-day.
 
 ### Polling interval
 
-Default: 2 minutes with fixed ±30-second jitter (minimum 60s between polls). Jitter is not configurable.
+Default: 2 minutes with fixed ±30-second jitter (minimum 10s between polls). Jitter is not configurable.
 
 ## Troubleshooting
 
